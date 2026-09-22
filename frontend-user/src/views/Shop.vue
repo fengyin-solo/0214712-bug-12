@@ -135,7 +135,7 @@
     </Modal>
 
     <!-- Checkout Modal -->
-    <Modal v-model="showCheckoutModal" icon="🛒" icon-type="info" title="确认订单" size="small" confirm-text="确认支付" :loading="checkoutLoading" @confirm="confirmCheckout">
+    <Modal v-model="showCheckoutModal" icon="🛒" icon-type="info" title="确认订单" size="small" confirm-text="确认支付" :loading="checkoutLoading" @confirm="confirmCheckout" @cancel="onCheckoutModalClosed">
       <div class="checkout-info">
         <div class="info-row"><span class="label">商品数量</span><span class="value">{{ cartItemCount }} 件</span></div>
         <div class="info-row total"><span class="label">应付金额</span><span class="value price">¥{{ cartTotal }}</span></div>
@@ -217,6 +217,8 @@ export default {
       showLoginModal: false,
       pendingAction: null,
       pendingProduct: null,
+      checkoutSeq: 0,
+      checkoutItems: [],
       categories: [
         { id: 'all', name: '全部商品', icon: '🏷️' },
         { id: 'cue', name: '球杆', icon: '🏏' },
@@ -321,27 +323,42 @@ export default {
       this.showCheckoutModal = true
     },
     async confirmCheckout() {
+      if (this.checkoutLoading || this.cart.length === 0) return
+      // 快照结算商品与金额：支付期间购物车变化不会串改本单结果
+      const seq = ++this.checkoutSeq
+      this.checkoutItems = this.cart.map(item => ({ ...item }))
+      const snapshotAmount = this.cartTotal
       this.checkoutLoading = true
       await new Promise(resolve => setTimeout(resolve, 1500))
+      // 支付途中关闭弹窗（取消）则丢弃结果，不生成订单
+      if (seq !== this.checkoutSeq) return
       const order = {
         orderNo: 'SP' + Date.now().toString().slice(-8),
-        amount: this.cartTotal,
-        items: [...this.cart],
+        amount: snapshotAmount,
+        items: [...this.checkoutItems],
         status: 'paid',
         createTime: new Date().toLocaleString()
       }
       this.orderResult = order
       this.orders.unshift(order) // 添加到订单列表
       this.cart = []
-      
-      // 添加到任务中心
+      this.checkoutItems = []
+
+      // 添加到任务中心（orderNo 幂等，重复提交不会产生重复订单任务）
       taskStore.addOrderTask(order)
-      
+
       this.checkoutLoading = false
       this.showCheckoutModal = false
       this.showSuccessModal = true
-      
+
       this.showNotification('info', '已添加到任务中心', `您可以在任务中心查看并管理此订单`)
+    },
+    onCheckoutModalClosed() {
+      // 支付中关闭：作废旧请求，返回后不再写入订单
+      if (this.checkoutLoading) {
+        this.checkoutSeq++
+        this.checkoutLoading = false
+      }
     },
     showNotification(type, title, message) {
       this.toastType = type

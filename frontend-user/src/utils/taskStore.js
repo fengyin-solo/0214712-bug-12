@@ -1,9 +1,21 @@
 /**
  * 任务中心存储管理
  * 统一管理预约、报名、订单等任务数据，使用 localStorage 持久化
+ *
+ * 设计约定：
+ * - 任务记录是「我的报名/预约/订单」的唯一事实来源，页面状态一律从这里派生
+ * - add() 按业务键幂等：同一课程/赛事/订单的有效记录只保留一条，防止重复报名
+ * - 取消（remove）会释放占用的名额；学习进度按 courseId 隔离更新，不会串课
+ * - taskState.version 在每次写入后自增，供 Vue 计算属性建立响应式依赖
  */
 
+import { reactive } from 'vue'
+
 const STORAGE_KEY = 'billiard_user_tasks'
+
+/** 响应式版本号：读取任务的计算属性访问它后，任何写入都会触发重新计算 */
+export const taskState = reactive({ version: 0 })
+
 const logger = {
   info: (...args) => console.log('[taskStore]', ...args),
   warn: (...args) => console.warn('[taskStore]', ...args),
@@ -106,10 +118,39 @@ const statusConfig = {
   cancelled: { text: '已取消', type: 'success' }
 }
 
+/** 终态：不再占用名额/不作为"进行中"的重复报名依据 */
+function isInactiveStatus(status) {
+  return status === 'completed' || status === 'cancelled'
+}
+
+/**
+ * 任务业务键：同一业务对象的有效任务只允许一条。
+ * 取消/完成后再次报名不会被拦截。
+ */
+function dedupKey(task) {
+  const extra = task.extra || {}
+  switch (task.type) {
+    case 'course':
+      return extra.courseId != null ? `course:${extra.courseId}` : null
+    case 'competition':
+      return extra.competitionId != null ? `competition:${extra.competitionId}` : null
+    case 'order':
+      return extra.orderNo ? `order:${extra.orderNo}` : null
+    case 'booking':
+      return extra.tableId != null && extra.date && extra.time
+        ? `booking:${extra.tableId}:${extra.date}:${extra.time}`
+        : null
+    default:
+      return null
+  }
+}
+
 function loadTasks() {
   try {
     const stored = localStorage.getItem(STORAGE_KEY)
-    return stored ? JSON.parse(stored) : getDefaultTasks()
+    if (!stored) return getDefaultTasks()
+    const parsed = JSON.parse(stored)
+    return Array.isArray(parsed) ? parsed : getDefaultTasks()
   } catch (e) {
     logger.error('加载任务失败', e)
     return getDefaultTasks()
@@ -146,7 +187,7 @@ function getDefaultTasks() {
       amount: 599,
       status: 'upcoming',
       createdAt: formatDate(new Date(Date.now() - 259200000)),
-      extra: { courseId: 1 }
+      extra: { courseId: 1, coach: '张明', lessons: '8课时', progress: 0 }
     },
     {
       id: 'T' + Date.now().toString() + '003',
@@ -188,18 +229,25 @@ function enrichTask(task) {
 
   return {
     ...task,
+    extra: { ...(task.extra || {}) },
     typeName: typeInfo?.name || task.type,
     typeIcon: typeInfo?.icon || '📋',
     statusText: statusInfo?.text || task.status,
     statusType: statusInfo?.type || 'info',
-    actions: actions
+    actions: actions.map(action => ({ ...action }))
   }
 }
 
 export const taskStore = {
+  /** 供计算属性建立响应式依赖（刷新/跨页面同步） */
+  version() {
+    return taskState.version
+  },
+
   getAll() {
-    const tasks = loadTasks()
-    return tasks.map(enrichTask).sort((a, b) => 
+    // 读取版本号：任何写入后派生列表自动刷新
+    void taskState.version
+    return loadTasks().map(enrichTask).sort((a, b) =>
       new Date(b.createdAt) - new Date(a.createdAt)
     )
   },
@@ -207,7 +255,7 @@ export const taskStore = {
   getByStatus(status) {
     const tasks = this.getAll()
     if (status === 'pending') {
-      return tasks.filter(t => t.status !== 'completed' && t.status !== 'cancelled')
+      return tasks.filter(t => !isInactiveStatus(t.status))
     }
     if (status === 'completed') {
       return tasks.filter(t => t.status === 'completed')
@@ -216,20 +264,36 @@ export const taskStore = {
   },
 
   getById(taskId) {
-    const tasks = loadTasks()
-    const task = tasks.find(t => t.id === taskId)
+    void taskState.version
+    const task = loadTasks().find(t => t.id === taskId)
     return task ? enrichTask(task) : null
   },
 
+  /**
+   * 新增任务（幂等）
+   * 同一业务键已存在有效任务时直接返回原任务，不产生重复记录
+   */
   add(taskData) {
     const tasks = loadTasks()
+    const key = dedupKey(taskData)
+    if (key) {
+      const existing = tasks.find(t => dedupKey(t) === key && !isInactiveStatus(t.status))
+      if (existing) {
+        logger.info('任务已存在，忽略重复提交', existing.id)
+        return enrichTask(existing)
+      }
+    }
+
+    // id/createdAt 由存储层生成，不允许调用方覆盖，避免主键冲突造成重复渲染
     const newTask = {
+      ...taskData,
+      extra: { ...(taskData.extra || {}) },
       id: generateTaskId(),
-      createdAt: formatDate(new Date()),
-      ...taskData
+      createdAt: formatDate(new Date())
     }
     tasks.unshift(newTask)
     saveTasks(tasks)
+    taskState.version++
     logger.info('任务已添加', newTask)
     return enrichTask(newTask)
   },
@@ -241,21 +305,31 @@ export const taskStore = {
       logger.warn('任务不存在', taskId)
       return null
     }
-    tasks[index] = { ...tasks[index], ...updates }
+    // id/createdAt/type 属于身份字段，禁止通过更新改写，防止记录串位
+    const safeUpdates = { ...updates }
+    delete safeUpdates.id
+    delete safeUpdates.createdAt
+    delete safeUpdates.type
+    tasks[index] = {
+      ...tasks[index],
+      ...safeUpdates,
+      extra: { ...(tasks[index].extra || {}), ...(safeUpdates.extra || {}) }
+    }
     saveTasks(tasks)
+    taskState.version++
     logger.info('任务已更新', taskId, updates)
     return enrichTask(tasks[index])
   },
 
   updateStatus(taskId, newStatus) {
-    const statusInfo = statusConfig[newStatus]
-    if (!statusInfo) {
+    if (!statusConfig[newStatus]) {
       logger.error('无效的状态', newStatus)
       return null
     }
     return this.update(taskId, { status: newStatus })
   },
 
+  /** 取消任务：物理删除并释放占用的名额 */
   remove(taskId) {
     const tasks = loadTasks()
     const filtered = tasks.filter(t => t.id !== taskId)
@@ -264,6 +338,7 @@ export const taskStore = {
       return false
     }
     saveTasks(filtered)
+    taskState.version++
     logger.info('任务已删除', taskId)
     return true
   },
@@ -285,18 +360,27 @@ export const taskStore = {
     })
   },
 
-  addCourseTask(course, enrollInfo) {
+  /**
+   * 添加课程报名任务（幂等）
+   * 完整快照课程信息，后续课程目录展示变化也不会篡改已报课程的价格与进度
+   */
+  addCourseTask(course, enrollInfo = {}) {
     return this.add({
       type: 'course',
       title: course.name,
-      subtitle: '报名成功，等待开课',
+      subtitle: enrollInfo.status === 'pending_payment' ? '待支付' : '报名成功，等待开课',
       amount: course.price,
-      status: 'upcoming',
+      status: enrollInfo.status || 'upcoming',
       extra: {
         courseId: course.id,
         orderNo: enrollInfo.orderNo,
+        courseIcon: course.icon,
         coach: course.coach,
-        lessons: course.lessons
+        lessons: course.lessons,
+        price: course.price,
+        originalPrice: course.originalPrice || null,
+        expireDate: enrollInfo.expireDate || null,
+        progress: 0
       }
     })
   },
@@ -335,10 +419,10 @@ export const taskStore = {
   markAsPaid(taskId) {
     const task = this.getById(taskId)
     if (!task) return null
-    
+
     let newStatus = 'upcoming'
     let newSubtitle = '支付成功'
-    
+
     if (task.type === 'order') {
       newStatus = 'pending_shipment'
       newSubtitle = '支付成功，待发货'
@@ -347,8 +431,53 @@ export const taskStore = {
     } else if (task.type === 'booking') {
       newSubtitle = '支付成功，等待使用'
     }
-    
+
     return this.update(taskId, { status: newStatus, subtitle: newSubtitle })
+  },
+
+  // ========== 课程报名派生状态（课程页唯一事实来源） ==========
+
+  /** 返回某门课程当前有效的报名任务（待付款/待开始/进行中/已完成） */
+  findCourseTask(courseId) {
+    return this.getAll().find(
+      t => t.type === 'course' && t.extra.courseId === courseId && !isInactiveStatus(t.status)
+    ) || null
+  },
+
+  isCourseEnrolled(courseId) {
+    return !!this.findCourseTask(courseId)
+  },
+
+  /** 当前用户对该课程的有效报名数（取消后会减少，用于名额占用） */
+  countActiveCourseEnrollments(courseId) {
+    return this.getAll().filter(
+      t => t.type === 'course' && t.extra.courseId === courseId && !isInactiveStatus(t.status)
+    ).length
+  },
+
+  getCourseEnrollments() {
+    return this.getAll().filter(t => t.type === 'course' && !isInactiveStatus(t.status))
+  },
+
+  /**
+   * 仅更新指定课程的学习进度（0-100），按 courseId 定位，
+   * 找不到对应报名记录时拒绝写入，保证课程之间进度不串改
+   */
+  updateCourseProgress(courseId, progress) {
+    const tasks = loadTasks()
+    const index = tasks.findIndex(
+      t => t.type === 'course' && t.extra && t.extra.courseId === courseId && !isInactiveStatus(t.status)
+    )
+    if (index === -1) {
+      logger.warn('课程报名记录不存在，无法更新进度', courseId)
+      return null
+    }
+    const clamped = Math.max(0, Math.min(100, Math.round(progress)))
+    tasks[index].extra = { ...(tasks[index].extra || {}), progress: clamped }
+    saveTasks(tasks)
+    taskState.version++
+    logger.info('课程进度已更新', { courseId, progress: clamped })
+    return enrichTask(tasks[index])
   },
 
   getPendingCount() {
@@ -361,6 +490,7 @@ export const taskStore = {
 
   clearAll() {
     saveTasks([])
+    taskState.version++
     logger.info('所有任务已清除')
   }
 }

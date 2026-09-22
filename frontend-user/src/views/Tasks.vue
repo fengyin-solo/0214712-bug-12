@@ -240,7 +240,7 @@
 <script>
 import Modal from '../components/Modal.vue'
 import Toast from '../components/Toast.vue'
-import { logger } from '../utils/api'
+import { logger, api, REQUEST_ABORTED_CODE, SESSION_EXPIRED_CODE } from '../utils/api'
 import { authState } from '../utils/auth'
 import { taskStore } from '../utils/taskStore'
 
@@ -263,8 +263,7 @@ export default {
       showToast: false,
       toastType: 'success',
       toastTitle: '',
-      toastMessage: '',
-      refreshKey: 0
+      toastMessage: ''
     }
   },
   computed: {
@@ -272,8 +271,8 @@ export default {
       if (!this.selectedTask || this.selectedTask.amount == null) return ''
       return '确认支付 ¥' + this.selectedTask.amount.toLocaleString() + ' 元'
     },
+    // 任务列表直接从存储派生：存储版本号变化（支付/取消/跨页面新增）后自动刷新
     allTasks() {
-      this.refreshKey
       return taskStore.getAll()
     },
     pendingTasks() {
@@ -301,16 +300,7 @@ export default {
       return authState.isLoggedIn
     }
   },
-  mounted() {
-    this.refreshTasks()
-  },
-  activated() {
-    this.refreshTasks()
-  },
   methods: {
-    refreshTasks() {
-      this.refreshKey++
-    },
     getTypeText() {
       const typeMap = {
         booking: '预约',
@@ -375,43 +365,55 @@ export default {
       this.showDetailModal = true
     },
     async confirmPay() {
-      if (!this.selectedTask) return
+      const taskId = this.selectedTask?.id
+      const amount = this.selectedTask?.amount
+      if (!taskId) return
       this.payLoading = true
-      
-      await new Promise(resolve => setTimeout(resolve, 1000))
-      
-      const updatedTask = taskStore.markAsPaid(this.selectedTask.id)
-      
+
+      const result = await api.doTaskAction({ taskId, action: 'pay' })
+
       this.payLoading = false
+
+      // 支付后任务已变更，丢弃快照，避免后续操作作用到旧记录
+      this.selectedTask = null
       this.showPayModal = false
-      
-      if (updatedTask) {
-        this.refreshTasks()
+
+      if (result.aborted || result.code === REQUEST_ABORTED_CODE) return
+
+      if (result.success && result.data?.success) {
         this.successTitle = '支付成功'
         this.successMessage = '您的订单已支付成功'
         this.showSuccessModal = true
-        logger.info('Payment successful', { taskId: this.selectedTask.id, amount: this.selectedTask.amount })
+        logger.info('Payment successful', { taskId, amount })
+      } else if (result.code === SESSION_EXPIRED_CODE) {
+        logger.warn('Pay blocked: session expired')
+        // 全局登录弹窗已由 401 统一处理触发
       } else {
-        this.showNotification('error', '支付失败', '请稍后重试')
+        this.showNotification('error', '支付失败', result.data?.message || result.error || '请稍后重试')
       }
     },
     async confirmCancel() {
-      if (!this.selectedTask) return
+      const taskId = this.selectedTask?.id
+      if (!taskId) return
       this.cancelLoading = true
-      
-      await new Promise(resolve => setTimeout(resolve, 800))
-      
-      const result = taskStore.remove(this.selectedTask.id)
-      
+
+      const result = await api.doTaskAction({ taskId, action: 'cancel' })
+
       this.cancelLoading = false
+
+      this.selectedTask = null
       this.showCancelModal = false
-      
-      if (result) {
-        this.refreshTasks()
-        this.showNotification('success', '取消成功', '任务已取消')
-        logger.info('Task cancelled', { taskId: this.selectedTask.id })
+
+      if (result.aborted || result.code === REQUEST_ABORTED_CODE) return
+
+      if (result.success && result.data?.success) {
+        // 取消后名额由 taskStore.remove 释放，课程/赛事列表重新派生即为可报名
+        this.showNotification('success', '取消成功', '任务已取消，名额已释放')
+        logger.info('Task cancelled', { taskId })
+      } else if (result.code === SESSION_EXPIRED_CODE) {
+        logger.warn('Cancel blocked: session expired')
       } else {
-        this.showNotification('error', '取消失败', '请稍后重试')
+        this.showNotification('error', '取消失败', result.data?.message || result.error || '请稍后重试')
       }
     },
     async handleRemind() {
@@ -420,11 +422,13 @@ export default {
       logger.info('Reminder sent', { taskId: this.selectedTask.id })
     },
     handleConfirm() {
-      if (!this.selectedTask) return
-      const result = taskStore.updateStatus(this.selectedTask.id, 'completed')
+      const taskId = this.selectedTask?.id
+      if (!taskId) return
+      const result = taskStore.updateStatus(taskId, 'completed')
       if (result) {
-        this.refreshTasks()
         this.showNotification('success', '确认收货成功', '感谢您的购买')
+      } else {
+        this.showNotification('error', '操作失败', '任务状态可能已变更，请刷新后重试')
       }
     },
     handleReview() {

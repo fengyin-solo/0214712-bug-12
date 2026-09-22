@@ -43,17 +43,17 @@
  * 应用根组件
  * 负责整合全局布局组件和管理登录状态
  */
-import { authState } from './utils/auth'
+import { authState, AUTH_EXPIRED_EVENT } from './utils/auth'
 import NavBar from './components/NavBar.vue'
 import FooterBar from './components/FooterBar.vue'
 import LoginModal from './components/LoginModal.vue'
 
 export default {
   name: 'App',
-  components: { 
+  components: {
     NavBar,
     FooterBar,
-    LoginModal 
+    LoginModal
   },
   data() {
     return {
@@ -76,11 +76,24 @@ export default {
       return authState.user?.name || 'U'
     }
   },
+  mounted() {
+    // 任意请求返回 401/403：统一弹出登录框（页面无需各自处理）
+    window.addEventListener(AUTH_EXPIRED_EVENT, this.handleAuthExpired)
+  },
+  beforeUnmount() {
+    window.removeEventListener(AUTH_EXPIRED_EVENT, this.handleAuthExpired)
+  },
   methods: {
     /**
      * 打开登录弹窗
      */
     openLogin() {
+      this.showLoginModal = true
+    },
+    /**
+     * 登录失效：确保登录框弹出，引导重新登录
+     */
+    handleAuthExpired() {
       this.showLoginModal = true
     },
     /**

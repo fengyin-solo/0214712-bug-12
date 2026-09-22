@@ -20,7 +20,7 @@
  */
 
 import { reactive } from 'vue'
-import { api, logger } from './api'
+import { api, logger, onUnauthorized } from './api'
 
 // ==================== 常量定义 ====================
 
@@ -29,6 +29,9 @@ const AUTH_TOKEN_KEY = 'billiard_token'
 
 /** localStorage中存储用户信息的键名 */
 const AUTH_USER_KEY = 'billiard_user'
+
+/** 登录失效广播事件名，页面可监听并引导重新登录 */
+export const AUTH_EXPIRED_EVENT = 'billiard:auth-expired'
 
 // ==================== 响应式状态 ====================
 
@@ -59,6 +62,27 @@ export const authState = reactive({
   loading: false,
   error: null
 })
+
+/**
+ * 登录失效广播
+ * 401/403 响应统一走到这里：清除本地会话，并通知页面弹出登录框。
+ * 不调用 logout() 以免对失效会话再次发起请求形成循环。
+ */
+function broadcastAuthExpired(message) {
+  clearAuth()
+  logger.warn('Session expired, auth state cleared', { message })
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT, { detail: { message } }))
+  }
+}
+
+// 订阅 API 层的 401/403 事件（mock 与真实请求均会触发）
+onUnauthorized(message => broadcastAuthExpired(message || '登录已失效，请重新登录'))
+
+/** 供非模块环境（如测试/外部脚本）手动标记登录失效 */
+export function expireSession(message) {
+  broadcastAuthExpired(message || '登录已失效，请重新登录')
+}
 
 // ==================== 公共方法 ====================
 
@@ -225,5 +249,7 @@ export default {
   login,
   logout,
   isAuthenticated,
-  getCurrentUser
+  getCurrentUser,
+  expireSession,
+  AUTH_EXPIRED_EVENT
 }

@@ -103,6 +103,7 @@
       confirm-text="确认预约"
       :loading="bookingLoading"
       @confirm="confirmBooking"
+      @cancel="onBookingModalClosed"
     >
       <div v-if="selectedTable" class="booking-form">
         <div class="booking-table-info">
@@ -239,6 +240,7 @@ export default {
       toastMessage: '',
       showLoginModal: false,
       pendingTable: null,
+      dateRequestSeq: 0,
       tableTypes: [
         { id: 'all', name: '全部', icon: '🎱' },
         { id: 'snooker', name: '斯诺克', icon: '🟢' },
@@ -279,9 +281,12 @@ export default {
   },
   methods: {
     async loadTablesForDate() {
+      // 请求序号：快速切换日期时，只接受最后一次请求的结果，避免旧响应覆盖新日期状态
+      const seq = ++this.dateRequestSeq
       this.isLoadingTables = true
       // 模拟API请求延迟
       await new Promise(resolve => setTimeout(resolve, 800))
+      if (seq !== this.dateRequestSeq) return
       // 模拟不同日期的球桌可用状态变化
       this.tables = this.tables.map(table => ({
         ...table,
@@ -313,11 +318,23 @@ export default {
       }
     },
     async confirmBooking() {
+      // loading 中重复点击直接忽略，防止重复预约
+      if (this.bookingLoading || !this.selectedTable) return
+      // 提交前再次校验球桌可用性（日期刷新后可能变为占用）
+      if (!this.selectedTable.available) {
+        this.showNotification('warning', '暂不可用', '该球桌当前时段已被占用，请重新选择')
+        this.showBookingModal = false
+        return
+      }
       this.bookingLoading = true
-      
+      this.bookingRequestSeq = (this.bookingRequestSeq || 0) + 1
+      const seq = this.bookingRequestSeq
+
       // Simulate API call
       await new Promise(resolve => setTimeout(resolve, 1500))
-      
+      // 支付途中关闭弹窗（取消）则丢弃结果，不生成预约
+      if (seq !== this.bookingRequestSeq) return
+
       const slot = this.timeSlots.find(s => s.id === this.selectedTimeSlot)
       const orderNo = 'BK' + Date.now().toString().slice(-8)
       this.bookingResult = {
@@ -327,8 +344,8 @@ export default {
         time: slot.time
       }
       this.successMessage = `${this.bookingDate} ${slot.time}`
-      
-      // 添加到任务中心
+
+      // 添加到任务中心（同一球桌/日期/时段幂等，不会重复）
       const bookingInfo = {
         orderNo,
         date: this.bookingDate,
@@ -336,12 +353,19 @@ export default {
         duration: this.duration
       }
       taskStore.addBookingTask(this.selectedTable, bookingInfo)
-      
+
       this.bookingLoading = false
       this.showBookingModal = false
       this.showSuccessModal = true
-      
+
       this.showNotification('info', '已添加到任务中心', `您可以在任务中心查看并管理此预约`)
+    },
+    onBookingModalClosed() {
+      if (this.bookingLoading) {
+        // 作废在途请求，返回后不再写入预约结果
+        this.bookingRequestSeq = (this.bookingRequestSeq || 0) + 1
+        this.bookingLoading = false
+      }
     },
     showNotification(type, title, message) {
       this.toastType = type

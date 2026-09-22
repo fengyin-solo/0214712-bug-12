@@ -56,7 +56,13 @@
               <span class="amount">¥{{ course.price }}</span>
               <span v-if="course.originalPrice" class="original">¥{{ course.originalPrice }}</span>
             </div>
-            <button class="btn-enroll" @click.stop="openEnrollModal(course)">
+            <button v-if="isEnrolled(course.id)" class="btn-enrolled" disabled>
+              <span>已报名</span>
+            </button>
+            <button v-else-if="course.full" class="btn-full" disabled>
+              <span>名额已满</span>
+            </button>
+            <button v-else class="btn-enroll" @click.stop="openEnrollModal(course)">
               <span>立即报名</span>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M5 12h14M12 5l7 7-7 7"/>
@@ -75,44 +81,44 @@
       size="large"
       :show-footer="false"
     >
-      <div v-if="selectedCourse" class="course-detail">
-        <div class="detail-header" :style="{ background: selectedCourse.gradient }">
-          <div class="detail-icon">{{ selectedCourse.icon }}</div>
-          <div class="detail-badge">{{ selectedCourse.level }}</div>
+      <div v-if="detailCourse" class="course-detail">
+        <div class="detail-header" :style="{ background: detailCourse.gradient }">
+          <div class="detail-icon">{{ detailCourse.icon }}</div>
+          <div class="detail-badge">{{ detailCourse.level }}</div>
         </div>
-        
+
         <div class="detail-content">
-          <h2>{{ selectedCourse.name }}</h2>
-          <p class="detail-desc">{{ selectedCourse.description }}</p>
-          
+          <h2>{{ detailCourse.name }}</h2>
+          <p class="detail-desc">{{ detailCourse.description }}</p>
+
           <div class="detail-stats">
             <div class="stat">
-              <span class="stat-value">{{ selectedCourse.duration }}</span>
+              <span class="stat-value">{{ detailCourse.duration }}</span>
               <span class="stat-label">课程时长</span>
             </div>
             <div class="stat">
-              <span class="stat-value">{{ selectedCourse.lessons }}</span>
+              <span class="stat-value">{{ detailCourse.lessons }}</span>
               <span class="stat-label">课时数量</span>
             </div>
             <div class="stat">
-              <span class="stat-value">{{ selectedCourse.students }}</span>
+              <span class="stat-value">{{ detailCourse.students }}</span>
               <span class="stat-label">已报名</span>
             </div>
           </div>
-          
+
           <div class="detail-coach">
-            <div class="coach-avatar large">{{ selectedCourse.coach.charAt(0) }}</div>
+            <div class="coach-avatar large">{{ detailCourse.coach.charAt(0) }}</div>
             <div class="coach-info">
-              <h4>{{ selectedCourse.coach }}</h4>
-              <span class="title">{{ selectedCourse.coachTitle }}</span>
-              <p class="bio">{{ selectedCourse.coachBio }}</p>
+              <h4>{{ detailCourse.coach }}</h4>
+              <span class="title">{{ detailCourse.coachTitle }}</span>
+              <p class="bio">{{ detailCourse.coachBio }}</p>
             </div>
           </div>
-          
+
           <div class="course-outline">
             <h4>课程大纲</h4>
             <div class="outline-list">
-              <div v-for="(item, index) in selectedCourse.outline" :key="index" class="outline-item">
+              <div v-for="(item, index) in detailCourse.outline" :key="index" class="outline-item">
                 <span class="outline-num">{{ String(index + 1).padStart(2, '0') }}</span>
                 <span class="outline-text">{{ item }}</span>
               </div>
@@ -121,10 +127,16 @@
           
           <div class="detail-footer">
             <div class="detail-price">
-              <span class="current">¥{{ selectedCourse.price }}</span>
-              <span v-if="selectedCourse.originalPrice" class="original">¥{{ selectedCourse.originalPrice }}</span>
+              <span class="current">¥{{ detailCourse.price }}</span>
+              <span v-if="detailCourse.originalPrice" class="original">¥{{ detailCourse.originalPrice }}</span>
             </div>
-            <button class="btn-enroll-large" @click="openEnrollModal(selectedCourse)">
+            <button v-if="isEnrolled(detailCourse.id)" class="btn-enroll-large enrolled" disabled>
+              已报名
+            </button>
+            <button v-else-if="detailCourse.full" class="btn-enroll-large full" disabled>
+              名额已满
+            </button>
+            <button v-else class="btn-enroll-large" @click="openEnrollModal(detailCourse)">
               立即报名
             </button>
           </div>
@@ -143,6 +155,7 @@
       confirm-text="确认支付"
       :loading="enrollLoading"
       @confirm="confirmEnroll"
+      @cancel="onEnrollModalClosed"
     >
       <div v-if="enrollCourse" class="enroll-info">
         <div class="info-row">
@@ -202,7 +215,7 @@
     <Modal v-model="showMyCoursesModal" title="我的课程" size="medium" :show-footer="false">
       <div class="my-courses-content">
         <div v-if="myCourses.length > 0" class="my-courses-list">
-          <div v-for="course in myCourses" :key="course.orderNo" class="my-course-card">
+          <div v-for="course in myCourses" :key="course.taskId" class="my-course-card">
             <div class="course-icon-small">{{ course.courseIcon }}</div>
             <div class="course-info-main">
               <h4>{{ course.courseName }}</h4>
@@ -230,6 +243,85 @@ import Toast from '../components/Toast.vue'
 import LoginModal from '../components/LoginModal.vue'
 import { isAuthenticated } from '../utils/auth'
 import { taskStore } from '../utils/taskStore'
+import {
+  api,
+  logger,
+  ALREADY_ENROLLED_CODE,
+  CAPACITY_FULL_CODE,
+  REQUEST_ABORTED_CODE,
+  SESSION_EXPIRED_CODE
+} from '../utils/api'
+
+// 课程内容目录（名称/价格/教练/大纲等展示信息以目录为准，不被异步结果改写）
+const COURSE_CATALOG = Object.freeze([
+  {
+    id: 1,
+    name: '台球入门基础课',
+    icon: '🎯',
+    level: '入门',
+    duration: '4周',
+    lessons: '8课时',
+    students: 156,
+    price: 599,
+    originalPrice: 799,
+    description: '从零开始学习台球，掌握基本姿势、握杆方法和击球技巧，适合完全没有基础的新手',
+    coach: '张明',
+    coachTitle: '高级教练',
+    coachBio: '10年教学经验，培养学员超过500人，擅长基础教学和纠正动作',
+    gradient: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+    outline: ['台球基础知识介绍', '正确的站姿与握杆', '基本击球动作练习', '直线球练习', '简单角度球', '基础走位概念', '实战练习', '结业考核']
+  },
+  {
+    id: 2,
+    name: '斯诺克进阶训练',
+    icon: '🎱',
+    level: '进阶',
+    duration: '6周',
+    lessons: '12课时',
+    students: 89,
+    price: 1299,
+    originalPrice: 1599,
+    description: '深入学习斯诺克战术布局，提升走位和防守能力，掌握高级杆法技巧',
+    coach: '李强',
+    coachTitle: '国家级教练',
+    coachBio: '前省队选手，15年执教经验，多次带队获得全国比赛冠军',
+    gradient: 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)',
+    outline: ['斯诺克规则深度解析', '高级杆法：低杆与高杆', '塞球技术详解', '走位规划与执行', '防守策略', '清台技巧', '比赛心态调整', '模拟比赛训练']
+  },
+  {
+    id: 3,
+    name: '九球高级技巧',
+    icon: '🏆',
+    level: '高级',
+    duration: '8周',
+    lessons: '16课时',
+    students: 45,
+    price: 1999,
+    originalPrice: 2499,
+    description: '掌握高级杆法、塞球技术和复杂局面处理，提升比赛实战能力',
+    coach: '王磊',
+    coachTitle: '职业选手',
+    coachBio: '现役职业选手，全国九球锦标赛前八，擅长实战技巧教学',
+    gradient: 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)',
+    outline: ['九球比赛规则与策略', '开球技巧优化', '组合球与翻袋', '高级塞球应用', '困难球处理', '安全球战术', '关键球心理', '实战对抗训练']
+  },
+  {
+    id: 4,
+    name: '比赛心理训练',
+    icon: '🧠',
+    level: '专业',
+    duration: '3周',
+    lessons: '6课时',
+    students: 32,
+    price: 999,
+    description: '提升比赛心理素质，学习压力管理和专注力训练，突破瓶颈期',
+    coach: '赵芳',
+    coachTitle: '运动心理师',
+    coachBio: '国家认证运动心理咨询师，服务多支省级运动队',
+    gradient: 'linear-gradient(135deg, #fa709a 0%, #fee140 100%)',
+    outline: ['运动心理学基础', '压力与焦虑管理', '专注力训练方法', '比赛前心理准备', '失误后的心态调整', '建立自信心']
+  }
+])
 
 export default {
   name: 'Courses',
@@ -241,154 +333,213 @@ export default {
       showSuccessModal: false,
       showMyCoursesModal: false, // 我的课程弹框
       enrollLoading: false,
-      selectedCourse: null,
-      enrollCourse: null,
+      selectedCourseId: null, // 详情只持有 ID，展示内容按 ID 从目录解析
+      enrollCourse: null, // 报名确认时的课程快照（价格/名称以快照为准）
       enrollResult: null,
-      myCourses: [], // 已报名课程列表
+      courses: COURSE_CATALOG.map(course => ({ ...course })),
       showToast: false,
       toastType: 'success',
       toastTitle: '',
       toastMessage: '',
       showLoginModal: false,
-      pendingCourse: null,
-      courses: [
-        {
-          id: 1,
-          name: '台球入门基础课',
-          icon: '🎯',
-          level: '入门',
-          duration: '4周',
-          lessons: '8课时',
-          students: 156,
-          price: 599,
-          originalPrice: 799,
-          description: '从零开始学习台球，掌握基本姿势、握杆方法和击球技巧，适合完全没有基础的新手',
-          coach: '张明',
-          coachTitle: '高级教练',
-          coachBio: '10年教学经验，培养学员超过500人，擅长基础教学和纠正动作',
-          gradient: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-          outline: ['台球基础知识介绍', '正确的站姿与握杆', '基本击球动作练习', '直线球练习', '简单角度球', '基础走位概念', '实战练习', '结业考核']
-        },
-        {
-          id: 2,
-          name: '斯诺克进阶训练',
-          icon: '🎱',
-          level: '进阶',
-          duration: '6周',
-          lessons: '12课时',
-          students: 89,
-          price: 1299,
-          originalPrice: 1599,
-          description: '深入学习斯诺克战术布局，提升走位和防守能力，掌握高级杆法技巧',
-          coach: '李强',
-          coachTitle: '国家级教练',
-          coachBio: '前省队选手，15年执教经验，多次带队获得全国比赛冠军',
-          gradient: 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)',
-          outline: ['斯诺克规则深度解析', '高级杆法：低杆与高杆', '塞球技术详解', '走位规划与执行', '防守策略', '清台技巧', '比赛心态调整', '模拟比赛训练']
-        },
-        {
-          id: 3,
-          name: '九球高级技巧',
-          icon: '🏆',
-          level: '高级',
-          duration: '8周',
-          lessons: '16课时',
-          students: 45,
-          price: 1999,
-          originalPrice: 2499,
-          description: '掌握高级杆法、塞球技术和复杂局面处理，提升比赛实战能力',
-          coach: '王磊',
-          coachTitle: '职业选手',
-          coachBio: '现役职业选手，全国九球锦标赛前八，擅长实战技巧教学',
-          gradient: 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)',
-          outline: ['九球比赛规则与策略', '开球技巧优化', '组合球与翻袋', '高级塞球应用', '困难球处理', '安全球战术', '关键球心理', '实战对抗训练']
-        },
-        {
-          id: 4,
-          name: '比赛心理训练',
-          icon: '🧠',
-          level: '专业',
-          duration: '3周',
-          lessons: '6课时',
-          students: 32,
-          price: 999,
-          description: '提升比赛心理素质，学习压力管理和专注力训练，突破瓶颈期',
-          coach: '赵芳',
-          coachTitle: '运动心理师',
-          coachBio: '国家认证运动心理咨询师，服务多支省级运动队',
-          gradient: 'linear-gradient(135deg, #fa709a 0%, #fee140 100%)',
-          outline: ['运动心理学基础', '压力与焦虑管理', '专注力训练方法', '比赛前心理准备', '失误后的心态调整', '建立自信心']
-        }
-      ]
+      pendingCourseId: null,
+      loadAbort: null,
+      enrollAbort: null
     }
   },
   computed: {
+    /** 详情课程：始终按 ID 从当前目录解析，快速切换/异步刷新不会显示旧课程内容 */
+    detailCourse() {
+      return this.courses.find(c => c.id === this.selectedCourseId) || null
+    },
+    /**
+     * 我的课程：从任务中心派生（唯一事实来源），
+     * 刷新、支付、取消后与列表/任务中心保持一致，不会重复显示
+     */
+    myCourses() {
+      return taskStore.getCourseEnrollments().map(task => {
+        const catalogCourse = this.courses.find(c => c.id === task.extra.courseId)
+        return {
+          taskId: task.id,
+          orderNo: task.extra.orderNo || task.id,
+          courseId: task.extra.courseId,
+          courseName: task.title,
+          courseIcon: task.extra.courseIcon || catalogCourse?.icon || '📚',
+          coach: task.extra.coach || catalogCourse?.coach || '',
+          lessons: task.extra.lessons || catalogCourse?.lessons || '',
+          expireDate: task.extra.expireDate || '',
+          progress: typeof task.extra.progress === 'number' ? task.extra.progress : 0
+        }
+      })
+    }
+  },
+  mounted() {
+    this.loadCourseCapacity()
+  },
+  beforeUnmount() {
+    // 离开课程页：取消在途的名额加载与报名请求，过期响应不再写入
+    this.loadAbort?.abort()
+    this.enrollAbort?.abort()
   },
   methods: {
+    /**
+     * 拉取课程名额信息并与本地目录合并。
+     * 只合并名额/已报名人数等统计字段，绝不覆盖名称/价格/教练/大纲。
+     */
+    async loadCourseCapacity() {
+      this.loadAbort?.abort()
+      const controller = new AbortController()
+      this.loadAbort = controller
+
+      const result = await api.getCourses(controller.signal)
+
+      // 过期响应（已被新请求或卸载取代）直接丢弃
+      if (this.loadAbort !== controller) return
+      if (!result.success) {
+        if (!result.aborted) {
+          logger.warn('Load courses failed', result.error)
+        }
+        return
+      }
+
+      const statsById = new Map(result.data.map(c => [c.id, c]))
+      this.courses = this.courses.map(course => {
+        const remote = statsById.get(course.id)
+        if (!remote) return { ...course }
+        return {
+          ...course,
+          students: remote.enrolledCount ?? remote.students ?? course.students,
+          availableSpots: remote.availableSpots,
+          full: !!remote.full
+        }
+      })
+    },
     openCourseDetail(course) {
-      this.selectedCourse = course
+      this.selectedCourseId = course.id
       this.showDetailModal = true
     },
     openEnrollModal(course) {
       if (!isAuthenticated()) {
-        this.pendingCourse = course
+        this.pendingCourseId = course.id
         this.showLoginModal = true
         return
       }
-      this.enrollCourse = course
+      // 打开前重新派生状态：已报名/满员时不允许再打开确认框
+      const latest = this.courses.find(c => c.id === course.id)
+      if (!latest || this.isEnrolled(latest.id)) return
+      if (latest.full) {
+        this.showNotification('warning', '名额已满', '该课程暂时没有剩余名额')
+        return
+      }
+      // 快照：确认框与提交结果都使用这份快照，列表后续刷新不会串改价格
+      this.enrollCourse = { ...latest }
       this.showDetailModal = false
       this.showEnrollModal = true
     },
+    isEnrolled(courseId) {
+      return taskStore.isCourseEnrolled(courseId)
+    },
     onLoginSuccess() {
       this.showLoginModal = false
-      if (this.pendingCourse) {
-        this.enrollCourse = this.pendingCourse
-        this.showDetailModal = false
-        this.showEnrollModal = true
-        this.pendingCourse = null
+      if (this.pendingCourseId != null) {
+        const course = this.courses.find(c => c.id === this.pendingCourseId)
+        this.pendingCourseId = null
+        if (course) this.openEnrollModal(course)
+      }
+    },
+    onEnrollModalClosed() {
+      // 加载中关闭（取消支付）：中断在途请求，避免返回后误写报名结果
+      if (this.enrollLoading) {
+        this.enrollAbort?.abort()
+        this.enrollLoading = false
       }
     },
     async confirmEnroll() {
+      if (!this.enrollCourse || this.enrollLoading) return
+
+      // 提交前二次校验，防止打开弹框后状态变化
+      const courseId = this.enrollCourse.id
+      if (taskStore.isCourseEnrolled(courseId)) {
+        this.showEnrollModal = false
+        this.showNotification('info', '无需重复报名', '您已报名该课程')
+        return
+      }
+      if (this.courses.find(c => c.id === courseId)?.full) {
+        this.showEnrollModal = false
+        this.showNotification('warning', '名额已满', '该课程暂时没有剩余名额')
+        return
+      }
+
       this.enrollLoading = true
-      
-      await new Promise(resolve => setTimeout(resolve, 1500))
-      
-      const expireDate = new Date()
-      expireDate.setMonth(expireDate.getMonth() + 6)
-      const orderNo = 'CR' + Date.now().toString().slice(-8)
-      
-      const courseOrder = {
+      this.enrollAbort?.abort()
+      const controller = new AbortController()
+      this.enrollAbort = controller
+
+      const result = await api.enrollCourse({ courseId, signal: controller.signal })
+
+      if (this.enrollAbort !== controller) return
+      this.enrollLoading = false
+
+      // 用户关闭弹窗/离开页面主动取消
+      if (result.aborted || result.code === REQUEST_ABORTED_CODE) {
+        return
+      }
+
+      if (!result.success) {
+        if (result.code === ALREADY_ENROLLED_CODE) {
+          this.showEnrollModal = false
+          await this.loadCourseCapacity()
+          this.showNotification('info', '无需重复报名', result.error)
+        } else if (result.code === CAPACITY_FULL_CODE) {
+          this.showEnrollModal = false
+          await this.loadCourseCapacity()
+          this.showNotification('warning', '名额已满', result.error)
+        } else if (result.code === SESSION_EXPIRED_CODE) {
+          this.showEnrollModal = false
+          // 全局会话失效处理会自动弹出登录框，这里只记录
+          logger.warn('Enroll blocked: session expired')
+        } else {
+          this.showNotification('error', '报名失败', result.error || '请稍后重试')
+        }
+        return
+      }
+
+      // 以确认时的课程快照落库，名称/价格/教练与用户看到的确认信息完全一致
+      const orderNo = result.data.orderNo
+      const expireDate = result.data.expireDate
+      const savedTask = taskStore.addCourseTask(this.enrollCourse, { orderNo, expireDate })
+
+      this.enrollResult = {
         orderNo,
         courseName: this.enrollCourse.name,
-        courseIcon: this.enrollCourse.icon,
-        coach: this.enrollCourse.coach,
-        lessons: this.enrollCourse.lessons,
-        price: this.enrollCourse.price,
-        expireDate: expireDate.toISOString().split('T')[0],
-        createTime: new Date().toLocaleString(),
-        progress: 0
+        expireDate
       }
-      
-      this.enrollResult = courseOrder
-      this.myCourses.unshift(courseOrder) // 添加到我的课程
-      
-      // 添加到任务中心
-      const enrollInfo = { orderNo }
-      taskStore.addCourseTask(this.enrollCourse, enrollInfo)
-      
-      this.enrollLoading = false
+
       this.showEnrollModal = false
       this.showSuccessModal = true
-      
-      this.showNotification('info', '已添加到任务中心', `您可以在任务中心查看并管理此课程`)
+      this.showNotification('info', '已添加到任务中心', '您可以在任务中心查看并管理此课程')
+
+      logger.info('Course enrolled', { courseId, orderNo, taskId: savedTask.id })
+      // 刷新名额统计（按钮变为"已报名"/满员）
+      this.loadCourseCapacity()
     },
     goToMyCourses() {
       this.showSuccessModal = false
       this.showMyCoursesModal = true
     },
+    /**
+     * 开始学习：只更新该课程自身的进度（按 courseId 定位），
+     * 其他课程的进度与任务结果不会被改动
+     */
     startStudy(course) {
+      const nextProgress = Math.min(100, (course.progress || 0) + 10)
+      const updated = taskStore.updateCourseProgress(course.courseId, nextProgress)
       this.showMyCoursesModal = false
-      this.showNotification('success', '开始学习', `正在进入"${course.courseName}"课程`)
+      if (updated) {
+        this.showNotification('success', '开始学习', `正在进入"${course.courseName}"课程，学习进度 ${nextProgress}%`)
+      } else {
+        this.showNotification('error', '操作失败', '课程报名记录不存在或已取消')
+      }
     },
     showNotification(type, title, message) {
       this.toastType = type
@@ -638,6 +789,27 @@ export default {
   transform: translateX(3px);
 }
 
+.btn-enrolled,
+.btn-full {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-secondary);
+  padding: 0.7rem 1.2rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  border-radius: 10px;
+  cursor: not-allowed;
+}
+
+.btn-enrolled {
+  border-color: rgba(0, 217, 165, 0.35);
+  color: var(--primary);
+  background: rgba(0, 217, 165, 0.08);
+}
+
 /* Course Detail Modal */
 .course-detail {
   margin: -20px -24px;
@@ -836,6 +1008,20 @@ export default {
 .btn-enroll-large:hover {
   transform: scale(1.02);
   box-shadow: 0 8px 30px var(--primary-glow);
+}
+
+.btn-enroll-large.enrolled,
+.btn-enroll-large.full {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}
+
+.btn-enroll-large.enrolled {
+  border-color: rgba(0, 217, 165, 0.35);
+  color: var(--primary);
+  background: rgba(0, 217, 165, 0.08);
 }
 
 /* Enroll Info */

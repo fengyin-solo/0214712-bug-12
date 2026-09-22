@@ -49,8 +49,8 @@
         <div class="card-right">
           <div class="prize-info"><span class="prize-label">奖金池</span><span class="prize-amount">¥{{ formatNumber(comp.prize) }}</span></div>
           <div class="fee-info"><span class="fee-label">报名费</span><span class="fee-amount">¥{{ comp.fee }}</span></div>
-          <button class="btn-action" :class="comp.status" @click="handleAction(comp)">
-            <span>{{ getActionText(comp.status) }}</span>
+          <button class="btn-action" :class="comp.status" :disabled="comp.status === 'upcoming' && (isCompFull(comp) || isCompEnrolled(comp))" @click="handleAction(comp)">
+            <span>{{ getActionText(comp) }}</span>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
           </button>
         </div>
@@ -67,7 +67,7 @@
     </div>
 
     <!-- Join Modal -->
-    <Modal v-model="showJoinModal" icon="🏆" icon-type="info" title="报名参赛" :subtitle="selectedComp?.name" size="small" confirm-text="确认报名" :loading="joinLoading" @confirm="confirmJoin">
+    <Modal v-model="showJoinModal" icon="🏆" icon-type="info" title="报名参赛" :subtitle="selectedComp?.name" size="small" confirm-text="确认报名" :loading="joinLoading" @confirm="confirmJoin" @cancel="onJoinModalClosed">
       <div v-if="selectedComp" class="join-info">
         <div class="info-row"><span class="label">比赛日期</span><span class="value">{{ selectedComp.date }}</span></div>
         <div class="info-row"><span class="label">比赛地点</span><span class="value">{{ selectedComp.location }}</span></div>
@@ -131,6 +131,13 @@ import Toast from '../components/Toast.vue'
 import LoginModal from '../components/LoginModal.vue'
 import { isAuthenticated } from '../utils/auth'
 import { taskStore } from '../utils/taskStore'
+import {
+  api,
+  ALREADY_ENROLLED_CODE,
+  CAPACITY_FULL_CODE,
+  REQUEST_ABORTED_CODE,
+  SESSION_EXPIRED_CODE
+} from '../utils/api'
 
 export default {
   name: 'Competitions',
@@ -150,7 +157,8 @@ export default {
       toastTitle: '',
       toastMessage: '',
       showLoginModal: false,
-      pendingComp: null,
+      pendingCompId: null,
+      joinAbort: null,
       tabs: [
         { id: 'upcoming', name: '即将开始', icon: '📅' },
         { id: 'ongoing', name: '进行中', icon: '🔴' },
@@ -169,19 +177,40 @@ export default {
   computed: {
     filteredCompetitions() { return this.competitions.filter(c => c.status === this.activeTab) }
   },
+  beforeUnmount() {
+    // 离开页面时取消在途报名请求
+    this.joinAbort?.abort()
+  },
   methods: {
     getCount(status) { return this.competitions.filter(c => c.status === status).length },
     getMonth(date) { return ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'][new Date(date).getMonth()] },
     getDay(date) { return new Date(date).getDate() },
     formatNumber(num) { return num.toLocaleString() },
     getActionText(status) { return { upcoming: '立即报名', ongoing: '观看直播', finished: '查看结果' }[status] },
+    isCompFull(comp) { return comp.participants >= comp.maxParticipants },
+    isCompEnrolled(comp) {
+      return taskStore.getAll().some(t =>
+        t.type === 'competition'
+        && t.extra?.competitionId === comp.id
+        && t.status !== 'completed'
+        && t.status !== 'cancelled'
+      )
+    },
     handleAction(comp) {
       this.selectedComp = comp
       if (comp.status === 'upcoming') {
         // 报名需要登录
         if (!isAuthenticated()) {
-          this.pendingComp = comp
+          this.pendingCompId = comp.id
           this.showLoginModal = true
+          return
+        }
+        if (this.isCompEnrolled(comp)) {
+          this.showNotification('info', '无需重复报名', '您已报名该赛事')
+          return
+        }
+        if (this.isCompFull(comp)) {
+          this.showNotification('warning', '名额已满', '该赛事报名人数已达上限')
           return
         }
         this.showJoinModal = true
@@ -191,29 +220,81 @@ export default {
     },
     onLoginSuccess() {
       this.showLoginModal = false
-      if (this.pendingComp) {
-        this.selectedComp = this.pendingComp
-        this.showJoinModal = true
-        this.pendingComp = null
+      if (this.pendingCompId != null) {
+        const comp = this.competitions.find(c => c.id === this.pendingCompId)
+        this.pendingCompId = null
+        if (comp && comp.status === 'upcoming' && !this.isCompFull(comp) && !this.isCompEnrolled(comp)) {
+          this.selectedComp = comp
+          this.showJoinModal = true
+        }
       }
     },
     async confirmJoin() {
-      this.joinLoading = true
-      await new Promise(resolve => setTimeout(resolve, 1500))
-      const regInfo = { 
-        regNo: 'REG' + Date.now().toString().slice(-8), 
-        playerNo: Math.floor(Math.random() * 100) + 1 
+      if (this.joinLoading) return
+      const comp = this.selectedComp
+      if (!comp) return
+
+      // 提交前二次校验
+      if (this.isCompEnrolled(comp)) {
+        this.showJoinModal = false
+        this.showNotification('info', '无需重复报名', '您已报名该赛事')
+        return
       }
-      this.joinResult = { ...regInfo, compName: this.selectedComp.name }
-      
-      // 添加到任务中心
-      taskStore.addCompetitionTask(this.selectedComp, regInfo)
-      
+      if (this.isCompFull(comp)) {
+        this.showJoinModal = false
+        this.showNotification('warning', '名额已满', '该赛事报名人数已达上限')
+        return
+      }
+
+      this.joinLoading = true
+      this.joinAbort?.abort()
+      const controller = new AbortController()
+      this.joinAbort = controller
+
+      const result = await api.joinCompetition({ competitionId: comp.id, signal: controller.signal })
+
+      if (this.joinAbort !== controller) return
       this.joinLoading = false
+
+      if (result.aborted || result.code === REQUEST_ABORTED_CODE) return
+
+      if (!result.success) {
+        if (result.code === ALREADY_ENROLLED_CODE) {
+          this.showJoinModal = false
+          this.showNotification('info', '无需重复报名', result.error)
+        } else if (result.code === CAPACITY_FULL_CODE) {
+          this.showJoinModal = false
+          this.showNotification('warning', '名额已满', result.error)
+        } else if (result.code === SESSION_EXPIRED_CODE) {
+          this.showJoinModal = false
+        } else {
+          this.showNotification('error', '报名失败', result.error || '请稍后重试')
+        }
+        return
+      }
+
+      const regInfo = {
+        regNo: result.data.regNo,
+        playerNo: result.data.playerNo
+      }
+      this.joinResult = { ...regInfo, compName: comp.name }
+
+      // 快照以确认时的赛事为准；存储幂等，不会生成重复任务
+      taskStore.addCompetitionTask(comp, regInfo)
+      // 本地占用一个名额，列表立即反映满员状态
+      comp.participants = Math.min(comp.maxParticipants, comp.participants + 1)
+
       this.showJoinModal = false
       this.showSuccessModal = true
-      
+
       this.showNotification('info', '已添加到任务中心', `您可以在任务中心查看并管理此赛事`)
+    },
+    onJoinModalClosed() {
+      // 加载中关闭：中断在途报名请求，避免返回后误写结果
+      if (this.joinLoading) {
+        this.joinAbort?.abort()
+        this.joinLoading = false
+      }
     },
     viewJoinDetail() {
       this.showSuccessModal = false
@@ -271,6 +352,7 @@ export default {
 .prize-amount { font-family: 'Space Grotesk', sans-serif; font-size: 1.5rem; font-weight: 700; color: var(--primary); }
 .fee-amount { font-size: 0.9rem; color: var(--text-secondary); }
 .btn-action { display: flex; align-items: center; gap: 0.5rem; border: none; padding: 0.7rem 1.25rem; font-size: 0.85rem; font-weight: 600; border-radius: 10px; cursor: pointer; transition: all 0.3s; margin-top: 0.5rem; }
+.btn-action:disabled { opacity: 0.55; cursor: not-allowed; }
 .btn-action.upcoming { background: var(--gradient-1); color: var(--bg-dark); }
 .btn-action.ongoing { background: linear-gradient(135deg, #ffc107 0%, #ff9800 100%); color: var(--bg-dark); }
 .btn-action.finished { background: rgba(255, 255, 255, 0.1); color: var(--text-primary); }
