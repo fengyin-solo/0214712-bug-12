@@ -102,7 +102,10 @@
       size="medium"
       confirm-text="确认预约"
       :loading="bookingLoading"
+      :confirm-disabled="bookingLoading"
+      :close-on-overlay="!bookingLoading"
       @confirm="confirmBooking"
+      @cancel="onBookingCancel"
     >
       <div v-if="selectedTable" class="booking-form">
         <div class="booking-table-info">
@@ -212,7 +215,8 @@
 import Modal from '../components/Modal.vue'
 import Toast from '../components/Toast.vue'
 import LoginModal from '../components/LoginModal.vue'
-import { isAuthenticated } from '../utils/auth'
+import { isAuthenticated, onSessionExpired } from '../utils/auth'
+import { api, isAbortError, isError, ErrorCodes } from '../utils/api'
 import { taskStore } from '../utils/taskStore'
 
 export default {
@@ -239,6 +243,12 @@ export default {
       toastMessage: '',
       showLoginModal: false,
       pendingTable: null,
+      // 日期切换请求序号：只有最后一次切换的响应可以写回，防止快速切换串位
+      tableLoadSeq: 0,
+      // 预约请求中止器
+      bookingAbort: null,
+      alive: true,
+      stopSessionListen: null,
       tableTypes: [
         { id: 'all', name: '全部', icon: '🎱' },
         { id: 'snooker', name: '斯诺克', icon: '🟢' },
@@ -273,30 +283,52 @@ export default {
     }
   },
   watch: {
-    selectedDate() {
-      this.loadTablesForDate()
+    selectedDate(newDate, oldDate) {
+      if (newDate !== oldDate) this.loadTablesForDate()
     }
+  },
+  mounted() {
+    this.stopSessionListen = onSessionExpired(() => {
+      if (!this.alive) return
+      this.resetBookingState()
+      this.showLoginModal = true
+      this.showNotification('warning', '登录已失效', '请重新登录后继续操作')
+    })
+  },
+  beforeUnmount() {
+    this.alive = false
+    // 使所有进行中的球桌加载响应失效
+    this.tableLoadSeq++
+    if (this.bookingAbort) this.bookingAbort.abort()
+    if (this.stopSessionListen) this.stopSessionListen()
   },
   methods: {
     async loadTablesForDate() {
+      // 每次切换生成新序号，过期响应（快速切换时先发出的请求）一律丢弃
+      const seq = ++this.tableLoadSeq
       this.isLoadingTables = true
-      // 模拟API请求延迟
-      await new Promise(resolve => setTimeout(resolve, 800))
-      // 模拟不同日期的球桌可用状态变化
-      this.tables = this.tables.map(table => ({
-        ...table,
-        available: Math.random() > 0.3
-      }))
-      this.isLoadingTables = false
+      try {
+        const result = await api.getTables({ date: this.selectedDate })
+        if (!this.alive || seq !== this.tableLoadSeq) return
+        if (result.success && Array.isArray(result.data)) {
+          // 以接口返回为准更新，保留目录基线，不随机污染原始数据
+          this.tables = result.data
+        }
+      } finally {
+        if (this.alive && seq === this.tableLoadSeq) {
+          this.isLoadingTables = false
+        }
+      }
     },
     openBooking(table) {
       // 检查是否已登录
       if (!isAuthenticated()) {
-        this.pendingTable = table
+        this.pendingTable = { ...table }
         this.showLoginModal = true
         return
       }
-      this.selectedTable = table
+      // 快照固定本次预约的球桌
+      this.selectedTable = { ...table }
       this.bookingDate = this.selectedDate
       this.selectedTimeSlot = 1
       this.duration = 2
@@ -308,40 +340,98 @@ export default {
     onLoginSuccess() {
       this.showLoginModal = false
       if (this.pendingTable) {
-        this.openBooking(this.pendingTable)
+        const table = { ...this.pendingTable }
         this.pendingTable = null
+        this.openBooking(table)
+      }
+    },
+    resetBookingState() {
+      this.bookingLoading = false
+      this.showBookingModal = false
+      if (this.bookingAbort) {
+        this.bookingAbort.abort()
+        this.bookingAbort = null
+      }
+    },
+    /** 提交中关闭弹框：中止预约请求 */
+    onBookingCancel() {
+      if (this.bookingLoading && this.bookingAbort) {
+        this.bookingAbort.abort()
+        this.bookingAbort = null
+        this.bookingLoading = false
+        this.showNotification('info', '已取消预约', '预约未提交')
       }
     },
     async confirmBooking() {
-      this.bookingLoading = true
-      
-      // Simulate API call
-      await new Promise(resolve => setTimeout(resolve, 1500))
-      
+      if (this.bookingLoading) return
+      if (!this.selectedTable) return
+      if (!isAuthenticated()) {
+        this.resetBookingState()
+        this.pendingTable = { ...this.selectedTable }
+        this.showLoginModal = true
+        return
+      }
+
       const slot = this.timeSlots.find(s => s.id === this.selectedTimeSlot)
-      const orderNo = 'BK' + Date.now().toString().slice(-8)
-      this.bookingResult = {
-        orderNo,
-        tableName: this.selectedTable.name,
-        date: this.bookingDate,
-        time: slot.time
+      if (!slot || !slot.available) {
+        this.showNotification('warning', '该时段已约满', '请选择其它时段')
+        return
       }
-      this.successMessage = `${this.bookingDate} ${slot.time}`
-      
-      // 添加到任务中心
-      const bookingInfo = {
-        orderNo,
-        date: this.bookingDate,
-        time: slot.time,
-        duration: this.duration
+
+      // 提交前校验：同球桌同时段已有进行中预约时直接拦截
+      const duplicate = taskStore.findActiveBooking(this.selectedTable.id, this.bookingDate, slot.time)
+      if (duplicate) {
+        this.showNotification('warning', '请勿重复预约', `该球桌 ${this.bookingDate} ${slot.time} 已有预约`)
+        return
       }
-      taskStore.addBookingTask(this.selectedTable, bookingInfo)
-      
+
+      const targetTable = { ...this.selectedTable }
+      const targetTime = slot.time
+      const targetDate = this.bookingDate
+      const targetDuration = this.duration
+      const controller = new AbortController()
+      this.bookingAbort = controller
+      this.bookingLoading = true
+
+      const result = await api.bookTable(
+        {
+          tableId: targetTable.id,
+          date: targetDate,
+          timeSlot: targetTime,
+          duration: targetDuration
+        },
+        { signal: controller.signal }
+      )
+
+      if (!this.alive) return
+      this.bookingAbort = null
       this.bookingLoading = false
-      this.showBookingModal = false
-      this.showSuccessModal = true
-      
-      this.showNotification('info', '已添加到任务中心', `您可以在任务中心查看并管理此预约`)
+
+      if (isAbortError(result)) {
+        this.showBookingModal = false
+        return
+      }
+
+      if (result.success) {
+        // 成功信息完全以接口返回为准
+        this.bookingResult = result.data
+        this.successMessage = `${result.data.date} ${result.data.time}`
+        this.showBookingModal = false
+        this.showSuccessModal = true
+        this.showNotification('info', '已添加到任务中心', `您可以在任务中心查看并管理此预约`)
+        return
+      }
+
+      if (isError(result, ErrorCodes.DUPLICATE)) {
+        this.showNotification('warning', '预约失败', result.error)
+      } else if (isError(result, ErrorCodes.AUTH_EXPIRED)) {
+        this.showBookingModal = false
+        this.pendingTable = targetTable
+        this.showLoginModal = true
+        this.showNotification('warning', '登录已失效', '请重新登录后继续操作')
+      } else {
+        this.showNotification('error', '预约失败', result.error || '请稍后重试')
+      }
     },
     showNotification(type, title, message) {
       this.toastType = type

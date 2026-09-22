@@ -20,7 +20,7 @@
  */
 
 import { reactive } from 'vue'
-import { api, logger } from './api'
+import { api, logger, setAuthExpiredHandler } from './api'
 
 // ==================== 常量定义 ====================
 
@@ -58,6 +58,41 @@ export const authState = reactive({
   token: null,
   loading: false,
   error: null
+})
+
+// ==================== 登录失效订阅 ====================
+
+/**
+ * 会话失效监听器集合。
+ * 请求返回 401 / 登录态过期时统一通知所有页面，
+ * 页面可据此弹出登录框，而不会在后台静默写错数据。
+ */
+const sessionExpiredListeners = new Set()
+
+/**
+ * 订阅登录失效事件
+ * @param {Function} listener - 失效回调
+ * @returns {Function} 取消订阅函数
+ */
+export function onSessionExpired(listener) {
+  sessionExpiredListeners.add(listener)
+  return () => sessionExpiredListeners.delete(listener)
+}
+
+function emitSessionExpired() {
+  sessionExpiredListeners.forEach(listener => {
+    try {
+      listener()
+    } catch (e) {
+      logger.error('Session expired listener error', e)
+    }
+  })
+}
+
+// 注册到 API 层：任何请求发现登录失效都会回调此处
+setAuthExpiredHandler(() => {
+  clearAuth()
+  emitSessionExpired()
 })
 
 // ==================== 公共方法 ====================
@@ -225,5 +260,6 @@ export default {
   login,
   logout,
   isAuthenticated,
-  getCurrentUser
+  getCurrentUser,
+  onSessionExpired
 }

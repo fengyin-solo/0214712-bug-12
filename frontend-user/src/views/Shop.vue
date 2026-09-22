@@ -135,10 +135,11 @@
     </Modal>
 
     <!-- Checkout Modal -->
-    <Modal v-model="showCheckoutModal" icon="🛒" icon-type="info" title="确认订单" size="small" confirm-text="确认支付" :loading="checkoutLoading" @confirm="confirmCheckout">
+    <Modal v-model="showCheckoutModal" icon="🛒" icon-type="info" title="确认订单" size="small" confirm-text="确认支付" :loading="checkoutLoading" :confirm-disabled="checkoutLoading || cart.length === 0" :close-on-overlay="!checkoutLoading" @confirm="confirmCheckout" @cancel="onCheckoutCancel">
       <div class="checkout-info">
         <div class="info-row"><span class="label">商品数量</span><span class="value">{{ cartItemCount }} 件</span></div>
         <div class="info-row total"><span class="label">应付金额</span><span class="value price">¥{{ cartTotal }}</span></div>
+        <p v-if="checkoutLoading" class="request-tip">支付提交中，请勿关闭或重复点击…</p>
       </div>
     </Modal>
 
@@ -189,7 +190,8 @@
 import Modal from '../components/Modal.vue'
 import Toast from '../components/Toast.vue'
 import LoginModal from '../components/LoginModal.vue'
-import { isAuthenticated } from '../utils/auth'
+import { isAuthenticated, onSessionExpired } from '../utils/auth'
+import { api, isAbortError, isError, ErrorCodes } from '../utils/api'
 import { taskStore } from '../utils/taskStore'
 
 export default {
@@ -208,7 +210,6 @@ export default {
       quantity: 1,
       cart: [],
       orderResult: null,
-      orders: [], // 订单列表
       showOrdersModal: false, // 订单列表弹框
       showToast: false,
       toastType: 'success',
@@ -217,6 +218,9 @@ export default {
       showLoginModal: false,
       pendingAction: null,
       pendingProduct: null,
+      checkoutAbort: null,
+      alive: true,
+      stopSessionListen: null,
       categories: [
         { id: 'all', name: '全部商品', icon: '🏷️' },
         { id: 'cue', name: '球杆', icon: '🏏' },
@@ -248,7 +252,36 @@ export default {
       return result
     },
     cartTotal() { return this.cart.reduce((sum, item) => sum + item.price * item.qty, 0) },
-    cartItemCount() { return this.cart.reduce((sum, item) => sum + item.qty, 0) }
+    cartItemCount() { return this.cart.reduce((sum, item) => sum + item.qty, 0) },
+    /**
+     * 我的订单：由任务中心订单记录派生（持久化、刷新不丢）。
+     * 金额/商品名以任务记录（服务端核价快照）为准，不从购物车内存重建。
+     */
+    orders() {
+      void taskStore.version
+      return taskStore.getAll()
+        .filter(t => t.type === 'order' && t.status !== 'cancelled')
+        .map(t => ({
+          orderNo: t.extra?.orderNo || t.id,
+          amount: t.amount,
+          items: t.extra?.items || [],
+          status: t.status === 'completed' ? 'completed' : 'paid',
+          createTime: t.extra?.createTime || t.createdAt
+        }))
+    }
+  },
+  mounted() {
+    this.stopSessionListen = onSessionExpired(() => {
+      if (!this.alive) return
+      this.resetCheckoutState()
+      this.showLoginModal = true
+      this.showNotification('warning', '登录已失效', '请重新登录后继续操作')
+    })
+  },
+  beforeUnmount() {
+    this.alive = false
+    if (this.checkoutAbort) this.checkoutAbort.abort()
+    if (this.stopSessionListen) this.stopSessionListen()
   },
   methods: {
     getCategoryCount(catId) {
@@ -259,14 +292,15 @@ export default {
       return this.categories.find(c => c.id === catId)?.name || ''
     },
     openProductDetail(product) {
-      this.selectedProduct = product
+      // 快照固定，快速切换商品详情时互不串改
+      this.selectedProduct = { ...product }
       this.quantity = 1
       this.showDetailModal = true
     },
     checkLoginRequired(action, product = null) {
       if (!isAuthenticated()) {
         this.pendingAction = action
-        this.pendingProduct = product
+        this.pendingProduct = product ? { ...product } : null
         this.showLoginModal = true
         return false
       }
@@ -317,31 +351,85 @@ export default {
     },
     checkout() {
       if (!this.checkLoginRequired('checkout')) return
+      if (this.cart.length === 0) {
+        this.showNotification('warning', '购物车为空', '请先选择商品')
+        return
+      }
       this.showCartModal = false
       this.showCheckoutModal = true
     },
-    async confirmCheckout() {
-      this.checkoutLoading = true
-      await new Promise(resolve => setTimeout(resolve, 1500))
-      const order = {
-        orderNo: 'SP' + Date.now().toString().slice(-8),
-        amount: this.cartTotal,
-        items: [...this.cart],
-        status: 'paid',
-        createTime: new Date().toLocaleString()
-      }
-      this.orderResult = order
-      this.orders.unshift(order) // 添加到订单列表
-      this.cart = []
-      
-      // 添加到任务中心
-      taskStore.addOrderTask(order)
-      
+    resetCheckoutState() {
       this.checkoutLoading = false
       this.showCheckoutModal = false
-      this.showSuccessModal = true
-      
-      this.showNotification('info', '已添加到任务中心', `您可以在任务中心查看并管理此订单`)
+      if (this.checkoutAbort) {
+        this.checkoutAbort.abort()
+        this.checkoutAbort = null
+      }
+    },
+    onCheckoutCancel() {
+      if (this.checkoutLoading && this.checkoutAbort) {
+        this.checkoutAbort.abort()
+        this.checkoutAbort = null
+        this.checkoutLoading = false
+        this.showNotification('info', '已取消支付', '订单未提交')
+      }
+    },
+    async confirmCheckout() {
+      if (this.checkoutLoading) return
+      if (!isAuthenticated()) {
+        this.resetCheckoutState()
+        this.checkLoginRequired('checkout')
+        return
+      }
+      if (this.cart.length === 0) {
+        this.showNotification('warning', '购物车为空', '请先选择商品')
+        return
+      }
+
+      // 固定本次结算的商品快照，快速操作/切换不会让金额和商品串位
+      const payloadItems = this.cart.map(item => ({
+        productId: item.id,
+        name: item.name,
+        icon: item.icon,
+        price: item.price,
+        quantity: item.qty
+      }))
+      const controller = new AbortController()
+      this.checkoutAbort = controller
+      this.checkoutLoading = true
+
+      const result = await api.createOrder(
+        { items: payloadItems },
+        { signal: controller.signal }
+      )
+
+      if (!this.alive) return
+      this.checkoutAbort = null
+      this.checkoutLoading = false
+
+      if (isAbortError(result)) {
+        this.showCheckoutModal = false
+        return
+      }
+
+      if (result.success) {
+        // 金额/订单号全部以接口核价结果为准
+        this.orderResult = result.data
+        this.cart = []
+        this.showCheckoutModal = false
+        this.showSuccessModal = true
+        this.showNotification('info', '已添加到任务中心', `您可以在任务中心查看并管理此订单`)
+        return
+      }
+
+      if (isError(result, ErrorCodes.AUTH_EXPIRED)) {
+        this.showCheckoutModal = false
+        this.pendingAction = 'checkout'
+        this.showLoginModal = true
+        this.showNotification('warning', '登录已失效', '请重新登录后继续操作')
+      } else {
+        this.showNotification('error', '下单失败', result.error || '请稍后重试')
+      }
     },
     showNotification(type, title, message) {
       this.toastType = type
@@ -461,6 +549,7 @@ export default {
 .info-row .value { font-weight: 500; }
 .info-row.total { border-top: 1px solid var(--border); padding-top: 0.75rem; margin-top: 0.25rem; }
 .info-row .value.price { font-family: 'Space Grotesk', sans-serif; font-size: 1.25rem; color: var(--primary); }
+.request-tip { font-size: 0.78rem; color: #ffc107; text-align: center; padding-top: 0.25rem; }
 @media (max-width: 900px) { .shop-layout { grid-template-columns: 1fr; } .sidebar { position: static; } .product-detail { grid-template-columns: 1fr; } .detail-image { min-height: 200px; } .detail-info { padding: 1.5rem; } }
 @media (max-width: 600px) { .shop-page { padding: 0 1.5rem 3rem; } .page-header h1 { font-size: 2rem; } .products-grid { grid-template-columns: repeat(2, 1fr); gap: 0.75rem; } .product-image { height: 120px; } .image-placeholder { font-size: 3rem; } }
 </style>

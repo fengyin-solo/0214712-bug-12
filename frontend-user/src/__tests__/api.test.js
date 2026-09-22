@@ -8,8 +8,9 @@
  * - 错误处理
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { api, logger } from '../utils/api'
+import { login as authLogin } from '../utils/auth'
 
 // ==================== API接口测试 ====================
 
@@ -93,19 +94,23 @@ describe('API Module', () => {
 
   describe('api.bookTable', () => {
     it('should create booking successfully', async () => {
+      // 预约为受保护接口，需先登录（auth.login 会持久化 token）
+      await authLogin('user', '123456')
+
       const bookingData = {
         tableId: 1,
         date: '2026-03-01',
         timeSlot: '14:00-16:00',
         duration: 2
       }
-      
+
       const result = await api.bookTable(bookingData)
-      
+
       expect(result.success).toBe(true)
       expect(result.data.orderNo).toBeDefined()
       expect(result.data.orderNo).toMatch(/^BK\d+$/)
       expect(result.data.status).toBe('upcoming')
+      expect(result.data.taskId).toBeDefined()
     })
   })
 
@@ -174,15 +179,19 @@ describe('API Module', () => {
 
   describe('api.createOrder', () => {
     it('should create order successfully', async () => {
+      // 下单为受保护接口，需先登录（auth.login 会持久化 token）
+      await authLogin('user', '123456')
+
       const orderData = {
         items: [{ productId: 1, quantity: 1 }]
       }
-      
+
       const result = await api.createOrder(orderData)
-      
+
       expect(result.success).toBe(true)
       expect(result.data.orderNo).toBeDefined()
       expect(result.data.orderNo).toMatch(/^SP\d+$/)
+      expect(result.data.taskId).toBeDefined()
     })
   })
 

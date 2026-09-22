@@ -140,6 +140,8 @@
       size="small"
       confirm-text="确认支付"
       :loading="payLoading"
+      :confirm-disabled="payLoading"
+      :close-on-overlay="!payLoading"
       @confirm="confirmPay"
     >
       <div class="pay-info">
@@ -172,6 +174,8 @@
       confirm-text="确认取消"
       confirm-type="danger"
       :loading="cancelLoading"
+      :confirm-disabled="cancelLoading"
+      :close-on-overlay="!cancelLoading"
       @confirm="confirmCancel"
     />
 
@@ -234,19 +238,23 @@
       :title="toastTitle"
       :message="toastMessage"
     />
+
+    <LoginModal v-model="showLoginModal" @success="onReloginSuccess" />
   </div>
 </template>
 
 <script>
 import Modal from '../components/Modal.vue'
 import Toast from '../components/Toast.vue'
+import LoginModal from '../components/LoginModal.vue'
 import { logger } from '../utils/api'
-import { authState } from '../utils/auth'
+import { api, isAbortError, isError, ErrorCodes } from '../utils/api'
+import { authState, onSessionExpired } from '../utils/auth'
 import { taskStore } from '../utils/taskStore'
 
 export default {
   name: 'Tasks',
-  components: { Modal, Toast },
+  components: { Modal, Toast, LoginModal },
   data() {
     return {
       activeTab: 'pending',
@@ -264,7 +272,11 @@ export default {
       toastType: 'success',
       toastTitle: '',
       toastMessage: '',
-      refreshKey: 0
+      showLoginModal: false,
+      // 支付/取消请求中止器
+      actionAbort: null,
+      alive: true,
+      stopSessionListen: null
     }
   },
   computed: {
@@ -273,7 +285,7 @@ export default {
       return '确认支付 ¥' + this.selectedTask.amount.toLocaleString() + ' 元'
     },
     allTasks() {
-      this.refreshKey
+      // taskStore 为响应式单一数据源，任务增删改后自动刷新，无需手动 refreshKey
       return taskStore.getAll()
     },
     pendingTasks() {
@@ -302,14 +314,34 @@ export default {
     }
   },
   mounted() {
-    this.refreshTasks()
+    this.stopSessionListen = onSessionExpired(() => {
+      if (!this.alive) return
+      this.closeActionModals()
+      this.showLoginModal = true
+      this.showNotification('warning', '登录已失效', '请重新登录后再管理任务')
+    })
   },
   activated() {
-    this.refreshTasks()
+    // keep-alive 复用时刷新（数据本身是响应式的，这里仅用于兼容路由复用）
+  },
+  beforeUnmount() {
+    this.alive = false
+    if (this.actionAbort) this.actionAbort.abort()
+    if (this.stopSessionListen) this.stopSessionListen()
   },
   methods: {
-    refreshTasks() {
-      this.refreshKey++
+    onReloginSuccess() {
+      this.showLoginModal = false
+    },
+    closeActionModals() {
+      this.payLoading = false
+      this.cancelLoading = false
+      this.showPayModal = false
+      this.showCancelModal = false
+      if (this.actionAbort) {
+        this.actionAbort.abort()
+        this.actionAbort = null
+      }
     },
     getTypeText() {
       const typeMap = {
@@ -324,13 +356,14 @@ export default {
       this.activeTab = tab
     },
     handleAction(task, action) {
+      // 复制快照，快速点击不同任务时弹窗始终展示所点任务，不共享可变引用
       this.selectedTask = { ...task }
-      
+
       if (action.route) {
         this.navigateToRoute(action.route, action.key, task)
         return
       }
-      
+
       const actionMap = {
         pay: () => this.openPayModal(),
         cancel: () => this.openCancelModal(),
@@ -346,7 +379,7 @@ export default {
     },
     navigateToRoute(route, actionKey, task) {
       logger.info('Navigate to business page', { route, actionKey, taskId: task.id, type: task.type })
-      
+
       const query = {}
       if (task.extra) {
         if (task.type === 'booking' && task.extra.tableId) {
@@ -362,7 +395,7 @@ export default {
           query.orderNo = task.extra.orderNo
         }
       }
-      
+
       this.$router.push({ path: route, query })
     },
     openPayModal() {
@@ -374,44 +407,70 @@ export default {
     openDetailModal() {
       this.showDetailModal = true
     },
+    /** 发起任务操作；返回结果，统一处理中止与登录失效 */
+    async runTaskAction(action, loadingKey) {
+      if (!this.selectedTask) return null
+      if (this[loadingKey]) return null
+
+      // 操作前确认任务仍存在，避免对已取消/已删除的旧卡片操作
+      const taskId = this.selectedTask.id
+      const current = taskStore.getById(taskId)
+      if (!current) {
+        this.showPayModal = false
+        this.showCancelModal = false
+        this.showNotification('info', '任务状态已更新', '该记录已不存在')
+        return null
+      }
+
+      const controller = new AbortController()
+      this.actionAbort = controller
+      this[loadingKey] = true
+
+      const result = await api.doTaskAction(
+        { taskId, action },
+        { signal: controller.signal }
+      )
+
+      if (!this.alive) return null
+      this.actionAbort = null
+      this[loadingKey] = false
+
+      if (isAbortError(result)) return null
+
+      if (!result.success && isError(result, ErrorCodes.AUTH_EXPIRED)) {
+        this.showPayModal = false
+        this.showCancelModal = false
+        this.showLoginModal = true
+        this.showNotification('warning', '登录已失效', '请重新登录后再管理任务')
+        return null
+      }
+
+      return result
+    },
     async confirmPay() {
-      if (!this.selectedTask) return
-      this.payLoading = true
-      
-      await new Promise(resolve => setTimeout(resolve, 1000))
-      
-      const updatedTask = taskStore.markAsPaid(this.selectedTask.id)
-      
-      this.payLoading = false
+      const result = await this.runTaskAction('pay', 'payLoading')
+      if (result === null) return
+
       this.showPayModal = false
-      
-      if (updatedTask) {
-        this.refreshTasks()
+      if (result.success) {
         this.successTitle = '支付成功'
         this.successMessage = '您的订单已支付成功'
         this.showSuccessModal = true
-        logger.info('Payment successful', { taskId: this.selectedTask.id, amount: this.selectedTask.amount })
+        logger.info('Payment successful', { taskId: this.selectedTask.id })
       } else {
-        this.showNotification('error', '支付失败', '请稍后重试')
+        this.showNotification('error', '支付失败', result.error || '请稍后重试')
       }
     },
     async confirmCancel() {
-      if (!this.selectedTask) return
-      this.cancelLoading = true
-      
-      await new Promise(resolve => setTimeout(resolve, 800))
-      
-      const result = taskStore.remove(this.selectedTask.id)
-      
-      this.cancelLoading = false
+      const result = await this.runTaskAction('cancel', 'cancelLoading')
+      if (result === null) return
+
       this.showCancelModal = false
-      
-      if (result) {
-        this.refreshTasks()
-        this.showNotification('success', '取消成功', '任务已取消')
+      if (result.success) {
+        this.showNotification('success', '取消成功', '任务已取消，名额已释放')
         logger.info('Task cancelled', { taskId: this.selectedTask.id })
       } else {
-        this.showNotification('error', '取消失败', '请稍后重试')
+        this.showNotification('error', '取消失败', result.error || '请稍后重试')
       }
     },
     async handleRemind() {
@@ -419,12 +478,14 @@ export default {
       this.showNotification('success', '已提醒', '已提醒卖家尽快发货')
       logger.info('Reminder sent', { taskId: this.selectedTask.id })
     },
-    handleConfirm() {
+    async handleConfirm() {
       if (!this.selectedTask) return
-      const result = taskStore.updateStatus(this.selectedTask.id, 'completed')
-      if (result) {
-        this.refreshTasks()
+      const result = await this.runTaskAction('confirm', 'payLoading')
+      if (result === null) return
+      if (result.success) {
         this.showNotification('success', '确认收货成功', '感谢您的购买')
+      } else {
+        this.showNotification('error', '操作失败', result.error || '请稍后重试')
       }
     },
     handleReview() {
